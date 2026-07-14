@@ -1,5 +1,7 @@
 # LimitsChecker
 
+![LimitsChecker demo](docs/demo.gif)
+
 A GNOME/AppIndicator tray indicator for **Claude Code usage limits**.
 
 A Claude-focused rework of [codexbar-gnome](https://github.com/antonshalin76/codexbar-gnome).
@@ -9,6 +11,9 @@ Anthropic usage endpoint directly. The only runtime dependencies are Python +
 GTK/AppIndicator (and `zenity` for the details window).
 
 ![LimitsChecker in the GNOME panel](docs/screenshot.png)
+
+*(The animation above is a stylized demo; the screenshot shows the actual menu —
+GNOME renders the tray menu without color, see the DBusMenu note below.)*
 
 It shows the limits Claude Code exposes in `/usage`, in the GNOME top bar:
 
