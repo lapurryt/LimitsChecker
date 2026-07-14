@@ -1,8 +1,7 @@
 # LimitsChecker
 
-![LimitsChecker demo](docs/demo.gif)
-
-A GNOME/AppIndicator tray indicator for **Claude Code usage limits**.
+A GNOME/AppIndicator tray indicator for **Claude Code usage limits** (with a
+macOS menu-bar version — see [`macos/`](macos/)).
 
 A Claude-focused rework of [codexbar-gnome](https://github.com/antonshalin76/codexbar-gnome).
 Unlike the original, it does **not** shell out to the `codexbar` CLI — it reads the
@@ -11,9 +10,6 @@ Anthropic usage endpoint directly. The only runtime dependencies are Python +
 GTK/AppIndicator (and `zenity` for the details window).
 
 ![LimitsChecker in the GNOME panel](docs/screenshot.png)
-
-*(The animation above is a stylized demo; the screenshot shows the actual menu —
-GNOME renders the tray menu without color, see the DBusMenu note below.)*
 
 It shows the limits Claude Code exposes in `/usage`, in the GNOME top bar:
 
@@ -141,6 +137,20 @@ PY
 ```bash
 sh uninstall.sh
 ```
+
+## macOS
+
+A menu-bar version (same data layer, rendered with `rumps`) lives in
+[`macos/`](macos/):
+
+```bash
+pip3 install rumps
+python3 macos/limitschecker.py
+```
+
+On macOS the OAuth token is usually in the login Keychain rather than a file —
+see [`macos/README.md`](macos/README.md) for the token-source note. (Not yet
+verified on a Mac — feedback welcome.)
 
 ## License
 
