@@ -8,6 +8,8 @@ Claude OAuth token straight from `~/.claude/.credentials.json` and queries the
 Anthropic usage endpoint directly. The only runtime dependencies are Python +
 GTK/AppIndicator (and `zenity` for the details window).
 
+![LimitsChecker in the GNOME panel](docs/screenshot.png)
+
 It shows the limits Claude Code exposes in `/usage`, in the GNOME top bar:
 
 - `Session` — 5-hour rolling session window
