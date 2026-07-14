@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""GNOME/AppIndicator tray indicator for Claude Code usage limits.
+
+Reads the Claude OAuth access token from ~/.claude/.credentials.json and calls
+the Anthropic usage endpoint directly. No external CLI is required.
+
+    GET https://api.anthropic.com/api/oauth/usage
+    Authorization: Bearer <accessToken>
+    anthropic-beta: oauth-2025-04-20
+
+Panel example:
+
+    Session 2% · Week 42% · Fable 59%
+
+  Session = 5-hour rolling session window
+  Week    = 7-day "all usage" weekly window
+  <model> = 7-day per-model (scoped) weekly window, when active
+  A leading "⚠ " appears when any window crosses CLAUDEBAR_WARN_PERCENT.
+
+The drop-down menu shows each window as a character progress bar. The bar leads
+each row (all block glyphs are equal width), so bars — and the text after them —
+line up across rows. Filled vs remaining differ by shape (█ vs ▒); GNOME Shell
+renders the DBusMenu without color, so shape alone conveys progress.
+
+Note: an AppIndicator menu is serialized to GNOME Shell over DBusMenu, which can
+only carry item text/icons — not real widgets — so the bar must be text.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+# Prefer the maintained Ayatana typelib; fall back to classic AppIndicator3 so
+# the app also starts on distros that ship only the older one.
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+except (ValueError, ImportError):
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3 as AppIndicator  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
+
+
+def _int_env(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
+    """Read an int env var, falling back to default on garbage and clamping.
+
+    A bad value (e.g. CLAUDEBAR_REFRESH_SECONDS=5m) must not crash the app at
+    import — under autostart there is no terminal to see the traceback.
+    """
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    return value
+
+
+APP_ID = "claudebar-gnome-indicator"
+APP_TITLE = os.environ.get("CLAUDEBAR_TITLE", "LimitsChecker")
+CREDENTIALS = Path(
+    os.environ.get("CLAUDEBAR_CREDENTIALS", str(Path.home() / ".claude/.credentials.json"))
+)
+ENDPOINT = os.environ.get("CLAUDEBAR_ENDPOINT", "https://api.anthropic.com/api/oauth/usage")
+BETA_HEADER = os.environ.get("CLAUDEBAR_BETA", "oauth-2025-04-20")
+REFRESH_SECONDS = _int_env("CLAUDEBAR_REFRESH_SECONDS", 300, lo=5)
+SHOW_SCOPED = os.environ.get("CLAUDEBAR_SHOW_SCOPED", "1") not in ("0", "false", "no")
+WARN_PERCENT = _int_env("CLAUDEBAR_WARN_PERCENT", 80, lo=0, hi=100)
+TIMEOUT = _int_env("CLAUDEBAR_TIMEOUT", 30, lo=1)
+ICON = os.environ.get("CLAUDEBAR_ICON", "")
+
+BAR_WIDTH = _int_env("CLAUDEBAR_BAR_WIDTH", 10, lo=0, hi=100)
+ROW_SLOTS = 12  # reusable menu rows for usage windows (generous for many scopes)
+FILL_CHAR = os.environ.get("CLAUDEBAR_FILL_CHAR", "█")
+TRACK_CHAR = os.environ.get("CLAUDEBAR_TRACK_CHAR", "▒")
+
+# Display names for the two fixed windows (also used in the panel).
+NAME_SESSION = os.environ.get("CLAUDEBAR_NAME_SESSION", "Session")
+NAME_WEEK = os.environ.get("CLAUDEBAR_NAME_WEEK", "Week")
+
+
+def _resolve_icon() -> tuple[str, str | None]:
+    """Return (icon_name, theme_dir). A custom file wins over the themed icon.
+
+    Drop ~/.config/claudebar-gnome/icon.svg (or .png), or set CLAUDEBAR_ICON to
+    an absolute path, to use a custom tray icon — no env needed for autostart.
+    """
+    candidates = []
+    if ICON:
+        candidates.append(Path(ICON).expanduser())
+    candidates += [
+        Path.home() / ".config/claudebar-gnome/icon.svg",
+        Path.home() / ".config/claudebar-gnome/icon.png",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p.stem, str(p.parent)
+    return "utilities-system-monitor", None
+
+
+class UsageError(Exception):
+    """Raised when usage data cannot be obtained."""
+
+
+def _read_token() -> str:
+    try:
+        data = json.loads(CREDENTIALS.read_text())
+    except FileNotFoundError:
+        raise UsageError(f"credentials not found: {CREDENTIALS}")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise UsageError(f"cannot read credentials: {exc}")
+
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        raise UsageError("no claudeAiOauth section in credentials")
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token:
+        raise UsageError("no accessToken in credentials")
+    # We do NOT pre-check expiresAt: it may be stale while the token still works
+    # (Claude Code can refresh server-side), and mixing ms/seconds epochs would
+    # brick us. A genuinely dead token is reported by the 401 handler below.
+    return token
+
+
+def _fetch_usage() -> dict[str, Any]:
+    token = _read_token()
+    req = urllib.request.Request(
+        ENDPOINT,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": BETA_HEADER,
+            "Accept": "application/json",
+            "User-Agent": "claudebar-gnome-indicator",
+        },
+    )
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8")[:300]
+        except Exception:
+            pass
+        if exc.code == 401:
+            raise UsageError("401 unauthorized — token invalid/expired, re-login to Claude")
+        raise UsageError(f"HTTP {exc.code}: {body or exc.reason}")
+    except urllib.error.URLError as exc:
+        raise UsageError(f"network error: {exc.reason}")
+    except (TimeoutError, OSError) as exc:
+        raise UsageError(f"network error: {exc}")
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise UsageError(f"bad JSON from usage endpoint: {exc}")
+    if not isinstance(payload, dict):
+        raise UsageError("unexpected usage JSON shape")
+    return payload
+
+
+def _pct(value: Any) -> int | None:
+    if isinstance(value, (int, float)):
+        return max(0, min(999, round(value)))
+    return None
+
+
+def _parse_dt(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _reset_absolute(raw: Any) -> str | None:
+    dt = _parse_dt(raw)
+    return dt.astimezone().strftime("%b %d %H:%M") if dt else None
+
+
+def _reset_countdown(raw: Any) -> str | None:
+    dt = _parse_dt(raw)
+    if dt is None:
+        return None
+    secs = (dt - datetime.now(dt.tzinfo)).total_seconds()
+    if secs <= 0:
+        return "now"
+    minutes = int(secs // 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _bar(pct: int | None) -> str:
+    """Character progress bar: filled █ + remaining ▒, equal-width glyphs.
+
+    The bar leads each row and has a fixed width, so the columns after it (%,
+    name) line up across rows. Fill vs track differ by shape, so it reads as
+    partial progress even though the menu is rendered without color by the shell.
+    """
+    p = max(0, min(100, pct or 0))
+    filled = round(p / 100 * BAR_WIDTH)
+    return FILL_CHAR * filled + TRACK_CHAR * (BAR_WIDTH - filled)
+
+
+class View:
+    """Normalized usage snapshot ready for rendering."""
+
+    def __init__(self) -> None:
+        # rows: (name, percent, resets_at_raw) — order = panel/menu order
+        self.rows: list[tuple[str, int | None, Any]] = []
+        self.scoped_names: set[str] = set()
+        self.warn = False
+        self.spend: str | None = None
+
+
+def _build_view(payload: dict[str, Any]) -> View:
+    view = View()
+    session: tuple[int | None, Any] = (None, None)
+    weekly: tuple[int | None, Any] = (None, None)
+    scoped: list[tuple[str, int, Any]] = []
+
+    limits = payload.get("limits")
+    if isinstance(limits, list):
+        for lim in limits:
+            if not isinstance(lim, dict):
+                continue
+            kind = str(lim.get("kind") or "")
+            pct = _pct(lim.get("percent"))
+            reset = lim.get("resets_at")
+            if str(lim.get("severity") or "normal") not in ("normal", ""):
+                view.warn = True
+            if kind == "session":
+                session = (pct, reset)
+            elif kind == "weekly_all":
+                weekly = (pct, reset)
+            elif kind == "weekly_scoped" and pct is not None and lim.get("is_active", True):
+                scope = lim.get("scope") if isinstance(lim.get("scope"), dict) else {}
+                model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+                label = str(model.get("display_name") or scope.get("surface") or "model")
+                scoped.append((label, pct, reset))
+
+    # Fallbacks for older/thinner responses without a `limits` array.
+    if session[0] is None and isinstance(payload.get("five_hour"), dict):
+        w = payload["five_hour"]
+        session = (_pct(w.get("utilization")), w.get("resets_at"))
+    if weekly[0] is None and isinstance(payload.get("seven_day"), dict):
+        w = payload["seven_day"]
+        weekly = (_pct(w.get("utilization")), w.get("resets_at"))
+
+    view.rows.append((NAME_SESSION, session[0], session[1]))
+    view.rows.append((NAME_WEEK, weekly[0], weekly[1]))
+    for label, pct, reset in scoped:
+        view.rows.append((label, pct, reset))
+        view.scoped_names.add(label)
+
+    for _, pct, _reset in view.rows:
+        if pct is not None and pct >= WARN_PERCENT:
+            view.warn = True
+
+    extra = payload.get("extra_usage")
+    if isinstance(extra, dict) and extra.get("is_enabled"):
+        u = _pct(extra.get("utilization"))
+        if u is not None:
+            view.spend = f"extra usage {u}%"
+
+    return view
+
+
+def _panel_label(view: View) -> str:
+    cells = []
+    for name, pct, _ in view.rows:
+        if not SHOW_SCOPED and name in view.scoped_names:
+            continue
+        cells.append(f"{name} {'--' if pct is None else str(pct) + '%'}")
+    text = " · ".join(cells) if cells else "no data"
+    return ("⚠ " + text) if view.warn else text
+
+
+def _menu_rows(view: View, pad=lambda s: s) -> list[str]:
+    """Plain-text rows: '<bar>  NN%  Name        ·  resets in ...'.
+
+    Bar first (fixed width) then the percent, so bars and percentages form clean
+    columns. `pad` center-pads the name to a constant pixel width (measured in
+    the menu font), so the trailing 'resets in ...' column lines up too.
+    """
+    lines = []
+    for name, pct, reset in view.rows:
+        if pct is None:
+            lines.append(f"{TRACK_CHAR * BAR_WIDTH}    --  {pad(name)}")
+            continue
+        cd = _reset_countdown(reset)
+        tail = f"  ·  resets in {cd}" if cd else ""
+        lines.append(f"{_bar(pct)}  {(str(pct) + '%').rjust(4)}  {pad(name)}{tail}")
+    if view.spend:
+        lines.append(view.spend)
+    return lines
+
+
+def _details_text(view: View) -> str:
+    lines = []
+    for name, pct, reset in view.rows:
+        val = "--" if pct is None else f"{pct}%"
+        at = _reset_absolute(reset)
+        lines.append(f"{name}: {val}" + (f"  (resets {at})" if at else ""))
+    if view.spend:
+        lines.append(view.spend)
+    return "\n".join(lines)
+
+
+class ClaudeBarIndicator:
+    def __init__(self) -> None:
+        icon_name, icon_dir = _resolve_icon()
+        category = AppIndicator.IndicatorCategory.SYSTEM_SERVICES
+        if icon_dir:
+            self.indicator = AppIndicator.Indicator.new_with_path(
+                APP_ID, icon_name, category, icon_dir
+            )
+        else:
+            self.indicator = AppIndicator.Indicator.new(APP_ID, icon_name, category)
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_title(APP_TITLE)
+
+        self.menu = Gtk.Menu()
+
+        # Reusable usage-window rows (plain-text labels).
+        self.row_items: list[Gtk.MenuItem] = []
+        for _ in range(ROW_SLOTS):
+            item = Gtk.MenuItem(label="")
+            self.menu.append(item)
+            self.row_items.append(item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.details_item = Gtk.MenuItem(label="Show details")
+        self.details_item.connect("activate", self.show_details)
+        self.menu.append(self.details_item)
+
+        self.refresh_item = Gtk.MenuItem(label="Refresh")
+        self.refresh_item.connect("activate", self.refresh)
+        self.menu.append(self.refresh_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda *_: Gtk.main_quit())
+        self.menu.append(quit_item)
+
+        self.menu.show_all()
+        # Width of one space in the menu font, for pixel-accurate name padding.
+        self._space_px = max(1, self._text_px("i i") - self._text_px("ii"))
+        # Middle-click on the tray icon triggers Refresh directly.
+        self.indicator.set_secondary_activate_target(self.refresh_item)
+        self.indicator.set_menu(self.menu)
+
+        # Monotonic refresh id so an older, slower response can't overwrite a
+        # newer one (e.g. middle-click during a slow request).
+        self._gen = 0
+        self.last_raw = ""
+        self.last_details = f"{APP_TITLE}: starting..."
+        self._set_rows([f"{APP_TITLE}: starting..."])
+        self.indicator.set_label(f"{APP_TITLE} …", "⚠ Session 100% · Week 100% · Model 100%")
+        self.refresh()
+        GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+
+    def _text_px(self, text: str) -> int:
+        return self.menu.create_pango_layout(text).get_pixel_size()[0]
+
+    def _name_padder(self, names: list[str]):
+        """Return a fn that center-pads each name to the widest name's px, so
+        shorter names sit centered in the column instead of sticking out left."""
+        uniq = {n for n in names if n}
+        widths = {n: self._text_px(n) for n in uniq}
+        target = max(widths.values(), default=0)
+        pads = {}
+        for n, w in widths.items():
+            extra = max(0, round((target - w) / self._space_px))
+            left = extra // 2
+            pads[n] = " " * left + n + " " * (extra - left)
+        return lambda s: pads.get(s, s)
+
+    def _set_rows(self, lines: list[str]) -> None:
+        for i, item in enumerate(self.row_items):
+            if i < len(lines):
+                item.set_label(lines[i])
+                item.show()
+            else:
+                item.hide()
+
+    def refresh(self, *_: object) -> bool:
+        self._gen += 1  # main-thread only (timer / activate / startup)
+        gen = self._gen
+        threading.Thread(target=self._refresh_worker, args=(gen,), daemon=True).start()
+        return True
+
+    def _refresh_worker(self, gen: int) -> None:
+        try:
+            payload = _fetch_usage()
+            view = _build_view(payload)
+            raw = json.dumps(payload, indent=2, ensure_ascii=False)
+            GLib.idle_add(self._apply_ok, gen, view, raw)
+        except UsageError as exc:
+            GLib.idle_add(self._apply_error, gen, str(exc))
+        except Exception as exc:  # never let the worker die silently
+            GLib.idle_add(self._apply_error, gen, f"{type(exc).__name__}: {exc}")
+
+    def _apply_ok(self, gen: int, view: View, raw: str) -> bool:
+        if gen != self._gen:
+            return False  # a newer refresh superseded this one
+        self.last_raw = raw
+        self.last_details = _details_text(view)
+        padder = self._name_padder([n for n, _, _ in view.rows])
+        self._set_rows(_menu_rows(view, padder))
+        self.indicator.set_label(_panel_label(view), "⚠ Session 100% · Week 100% · Model 100%")
+        return False
+
+    def _apply_error(self, gen: int, message: str) -> bool:
+        if gen != self._gen:
+            return False
+        self.last_details = f"{APP_TITLE}: ERROR: {message}"
+        self._set_rows([f"⚠ ERROR: {message}"[:120]])
+        self.indicator.set_label("⚠ error", "⚠ error")
+        return False
+
+    def show_details(self, *_: object) -> None:
+        text = self.last_details
+        if self.last_raw:
+            text += "\n\nRaw JSON:\n" + self.last_raw
+
+        def _run() -> None:
+            # Runs off the main loop: zenity blocks until the window closes, and
+            # communicate() also reaps the process (no zombie).
+            try:
+                proc = subprocess.Popen(
+                    ["zenity", "--text-info", "--title", APP_TITLE, "--width", "900", "--height", "650"],
+                    stdin=subprocess.PIPE,
+                    text=True,
+                )
+                proc.communicate(text)
+            except OSError as exc:
+                GLib.idle_add(self._set_rows, [f"cannot open details: {exc}"[:120]])
+
+        threading.Thread(target=_run, daemon=True).start()
+
+
+def _acquire_single_instance() -> socket.socket | None:
+    """Bind an abstract UNIX socket as a lock; None if another instance holds it."""
+    lock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        lock.bind("\0" + APP_ID)
+    except OSError:
+        return None
+    return lock
+
+
+def main() -> None:
+    lock = _acquire_single_instance()
+    if lock is None:
+        print(f"{APP_ID}: already running", file=sys.stderr)
+        return
+    ClaudeBarIndicator()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LimitsChecker
+Comment=Show Claude Code usage limits in the GNOME top bar
+Exec=@HOME@/.local/bin/claudebar-gnome-indicator
+Icon=@HOME@/.config/claudebar-gnome/icon.png
+Terminal=false
+X-GNOME-Autostart-enabled=true
+Categories=Utility;
