@@ -1,6 +1,6 @@
 # LimitsChecker
 
-![LimitsChecker](docs/demo.gif)
+![LimitsChecker](/home/il/Downloads/LimitsChecker.gif)
 
 A GNOME/AppIndicator tray indicator for **Claude Code usage limits** (with a
 macOS menu-bar version — see [`macos/`](macos/)).
