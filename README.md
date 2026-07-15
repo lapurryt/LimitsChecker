@@ -105,7 +105,7 @@ Environment variables:
 | `CLAUDEBAR_CREDENTIALS` | `~/.claude/.credentials.json` | Path to Claude OAuth credentials |
 | `CLAUDEBAR_ENDPOINT` | `https://api.anthropic.com/api/oauth/usage` | Usage endpoint |
 | `CLAUDEBAR_BETA` | `oauth-2025-04-20` | `anthropic-beta` header value |
-| `CLAUDEBAR_REFRESH_SECONDS` | `300` | Refresh interval (min 5) |
+| `CLAUDEBAR_REFRESH_SECONDS` | `60` | Refresh interval in seconds (floor 5) |
 | `CLAUDEBAR_TIMEOUT` | `30` | HTTP timeout, seconds (min 1) |
 | `CLAUDEBAR_WARN_PERCENT` | `80` | Threshold (0–100) for the `⚠` badge |
 | `CLAUDEBAR_SHOW_SCOPED` | `1` | Show the active per-model weekly window in the panel |

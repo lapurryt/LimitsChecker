@@ -79,7 +79,7 @@ CREDENTIALS = Path(
 )
 ENDPOINT = os.environ.get("CLAUDEBAR_ENDPOINT", "https://api.anthropic.com/api/oauth/usage")
 BETA_HEADER = os.environ.get("CLAUDEBAR_BETA", "oauth-2025-04-20")
-REFRESH_SECONDS = _int_env("CLAUDEBAR_REFRESH_SECONDS", 300, lo=5)
+REFRESH_SECONDS = _int_env("CLAUDEBAR_REFRESH_SECONDS", 60, lo=5)
 SHOW_SCOPED = os.environ.get("CLAUDEBAR_SHOW_SCOPED", "1") not in ("0", "false", "no")
 WARN_PERCENT = _int_env("CLAUDEBAR_WARN_PERCENT", 80, lo=0, hi=100)
 TIMEOUT = _int_env("CLAUDEBAR_TIMEOUT", 30, lo=1)
