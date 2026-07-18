@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -66,6 +67,10 @@ KEYCHAIN_SERVICE = os.environ.get("LIMITSCHECKER_KEYCHAIN_SERVICE", "Claude Code
 ENDPOINT = os.environ.get("LIMITSCHECKER_ENDPOINT", "https://api.anthropic.com/api/oauth/usage")
 BETA_HEADER = os.environ.get("LIMITSCHECKER_BETA", "oauth-2025-04-20")
 REFRESH_SECONDS = _int_env("LIMITSCHECKER_REFRESH_SECONDS", 60, lo=5)
+# After a failed poll, retry this soon instead of waiting the full refresh cycle.
+RETRY_SECONDS = _int_env("LIMITSCHECKER_RETRY_SECONDS", 30, lo=5)
+# Attempts per poll to ride out a transient blip (rate-limit / network hiccup).
+FETCH_ATTEMPTS = _int_env("LIMITSCHECKER_FETCH_ATTEMPTS", 3, lo=1, hi=10)
 TIMEOUT = _int_env("LIMITSCHECKER_TIMEOUT", 30, lo=1)
 WARN_PERCENT = _int_env("LIMITSCHECKER_WARN_PERCENT", 80, lo=0, hi=100)
 BAR_WIDTH = _int_env("LIMITSCHECKER_BAR_WIDTH", 10, lo=0, hi=100)
@@ -78,6 +83,19 @@ ROW_SLOTS = 12
 
 class UsageError(Exception):
     """Raised when usage data cannot be obtained."""
+
+
+class UsageTransient(UsageError):
+    """A transient failure (rate-limit, 5xx, network) worth retrying soon.
+
+    The usage endpoint itself is rate-limited: a burst of polls returns 429.
+    Treat those — plus 5xx and network blips — as transient so one bad poll
+    never blanks the menu; retry_after carries the endpoint's hint when given.
+    """
+
+    def __init__(self, message: str, retry_after: "float | None" = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 def _token_from_json(blob: str, where: str) -> str:
@@ -119,7 +137,7 @@ def _read_token() -> str:
     )
 
 
-def _fetch_usage() -> dict[str, Any]:
+def _fetch_usage_once() -> dict[str, Any]:
     token = _read_token()
     req = urllib.request.Request(
         ENDPOINT,
@@ -141,20 +159,51 @@ def _fetch_usage() -> dict[str, Any]:
         except Exception:
             pass
         if exc.code == 401:
+            # Auth failures aren't transient — the token is dead until Claude
+            # Code (or a re-login) refreshes the credentials.
             raise UsageError("401 unauthorized — token invalid/expired, re-login to Claude")
+        if exc.code == 429 or exc.code >= 500:
+            retry_after = None
+            hdr = exc.headers.get("Retry-After") if exc.headers else None
+            if hdr:
+                try:
+                    retry_after = float(hdr)
+                except ValueError:
+                    retry_after = None
+            label = "429 rate-limited" if exc.code == 429 else f"HTTP {exc.code}"
+            raise UsageTransient(f"{label}: {body or exc.reason}", retry_after)
         raise UsageError(f"HTTP {exc.code}: {body or exc.reason}")
     except urllib.error.URLError as exc:
-        raise UsageError(f"network error: {exc.reason}")
+        raise UsageTransient(f"network error: {exc.reason}")
     except (TimeoutError, OSError) as exc:
-        raise UsageError(f"network error: {exc}")
+        raise UsageTransient(f"network error: {exc}")
 
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise UsageError(f"bad JSON from usage endpoint: {exc}")
+        # A truncated body or a gateway HTML error page — treat as transient.
+        raise UsageTransient(f"bad JSON from usage endpoint: {exc}")
     if not isinstance(payload, dict):
         raise UsageError("unexpected usage JSON shape")
     return payload
+
+
+def _fetch_usage() -> dict[str, Any]:
+    """Fetch usage, retrying a few times on transient failures.
+
+    Runs in a worker thread, so the short blocking sleeps here never touch the
+    UI. Longer waits are handled by the app's retry timer instead, so the
+    in-fetch sleep is capped small.
+    """
+    for attempt in range(FETCH_ATTEMPTS):
+        try:
+            return _fetch_usage_once()
+        except UsageTransient as exc:
+            if attempt + 1 >= FETCH_ATTEMPTS:
+                raise
+            delay = exc.retry_after if exc.retry_after is not None else (1 + attempt * 2)
+            time.sleep(max(0.0, min(delay, 5.0)))
+    raise UsageTransient("exhausted retries")  # unreachable; satisfies type-checkers
 
 
 def _pct(value: Any) -> "int | None":
@@ -303,6 +352,11 @@ class LimitsCheckerApp(rumps.App):
         super().__init__(APP_TITLE, title=f"{APP_TITLE} …", quit_button=None)
         self._rows = [rumps.MenuItem("") for _ in range(ROW_SLOTS)]
         self._details_text = f"{APP_TITLE}: starting..."
+        # Last successful snapshot + pending one-shot retry, so a failed poll
+        # keeps showing good data instead of blanking the menu.
+        self._last_view: "View | None" = None
+        self._last_error: "str | None" = None
+        self._retry_timer: "rumps.Timer | None" = None
         self.menu = [
             *self._rows,
             None,
@@ -333,19 +387,52 @@ class LimitsCheckerApp(rumps.App):
             view = _build_view(_fetch_usage())
             _on_main(self._apply_ok, view)
         except UsageError as exc:
-            _on_main(self._apply_error, str(exc))
+            _on_main(self._apply_error, str(exc), isinstance(exc, UsageTransient))
         except Exception as exc:
-            _on_main(self._apply_error, f"{type(exc).__name__}: {exc}")
+            _on_main(self._apply_error, f"{type(exc).__name__}: {exc}", True)
 
     def _apply_ok(self, view: View) -> None:
+        if self._retry_timer is not None:
+            self._retry_timer.stop()
+            self._retry_timer = None
+        self._last_view = view
+        self._last_error = None
         self._details_text = _details_text(view)
         self._set_rows(_menu_rows(view))
         self.title = _panel_label(view)
 
-    def _apply_error(self, message: str) -> None:
-        self._details_text = f"{APP_TITLE}: ERROR: {message}"
-        self._set_rows([f"⚠ ERROR: {message}"[:120]])
-        self.title = "⚠ error"
+    def _apply_error(self, message: str, transient: bool) -> None:
+        self._last_error = message
+        view = self._last_view
+        if view is not None:
+            # A single failed poll must not blank the menu bar. Keep the last
+            # good numbers visible, note the failure at the foot of the menu,
+            # and let the retry timer recover — most blips clear within one try.
+            rows = _menu_rows(view)
+            rows.append(f"⚠ last update failed — retrying · {message}"[:120])
+            self._set_rows(rows)
+            self.title = _panel_label(view)
+            self._details_text = _details_text(view) + f"\n\n⚠ last update failed: {message}"
+        else:
+            # No good data yet (e.g. first poll on a dead token) — surface it.
+            self._details_text = f"{APP_TITLE}: ERROR: {message}"
+            self._set_rows([f"⚠ ERROR: {message}"[:120]])
+            self.title = "⚠ error"
+        # Transient failures retry soon; auth/other failures back off further so
+        # we don't hammer a dead token (it recovers when Claude Code refreshes).
+        self._schedule_retry(RETRY_SECONDS if transient else RETRY_SECONDS * 4)
+
+    def _schedule_retry(self, delay: int) -> None:
+        if self._retry_timer is not None:
+            return  # a retry is already queued
+        self._retry_timer = rumps.Timer(self._do_retry, delay)
+        self._retry_timer.start()
+
+    def _do_retry(self, _sender) -> None:
+        if self._retry_timer is not None:
+            self._retry_timer.stop()
+            self._retry_timer = None
+        self.on_refresh(None)
 
     def on_details(self, _sender) -> None:
         # Write to a temp file and open it in the default text editor.
